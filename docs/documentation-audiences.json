@@ -397,6 +397,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/task-quality-prototype.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/supervision-protocols/claude.md",
       "audience": "agent-runtime"
     },

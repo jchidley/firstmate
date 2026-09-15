@@ -177,6 +177,7 @@ assert_clean() {
 
 load_record() {
   RECORD=$1
+  local contract_json expected_route
   [ -f "$RECORD" ] || die "evidence record does not exist: $RECORD"
   jq -e 'type == "object" and .schema == "fm-task-quality-evidence.v1"' "$RECORD" >/dev/null 2>&1 \
     || die "invalid evidence record: $RECORD"
@@ -186,9 +187,20 @@ load_record() {
   [ "$(hash_file "$CONTRACT_PATH")" = "$CONTRACT_SHA" ] \
     || die "contract changed after initialization; evidence is stale"
   validate_contract "$CONTRACT_PATH"
-  ROOT=$(jq -er '.contract.repository.root' "$RECORD")
-  WORKTREE=$(jq -er '.contract.repository.worktree' "$RECORD")
-  BASE_SHA=$(jq -er '.contract.repository.base_sha' "$RECORD")
+  contract_json=$(jq -c . "$CONTRACT_PATH")
+  expected_route=$(record_route "$CONTRACT_PATH")
+  jq -e --argjson contract "$contract_json" --arg route "$expected_route" '
+    .contract == $contract
+    and .task_id == $contract.task_id
+    and .route == $route
+    and .repository.root == $contract.repository.root
+    and .repository.worktree == $contract.repository.worktree
+    and .repository.base_sha == $contract.repository.base_sha
+  ' "$RECORD" >/dev/null 2>&1 \
+    || die "evidence record does not match its authoritative contract"
+  ROOT=$(jq -er '.repository.root' "$CONTRACT_PATH")
+  WORKTREE=$(jq -er '.repository.worktree' "$CONTRACT_PATH")
+  BASE_SHA=$(jq -er '.repository.base_sha' "$CONTRACT_PATH")
   verify_isolated_worktree "$ROOT" "$WORKTREE" >/dev/null
 }
 
@@ -480,15 +492,6 @@ finalize_record() {
           and $root.evidence.checks[$id].status == "passed"
           and $root.evidence.checks[$id].exit_code == 0)
   ' "$RECORD" >/dev/null 2>&1 || die "baseline evidence is missing or inconsistent"
-  assess_patch
-  FINALIZATION_RECHECK=true
-  while IFS= read -r check_id; do
-    run_check "$check_id" || die "mandatory post-patch check failed during finalization: $check_id"
-  done < <(jq -r '.contract.checks[] | select(.phase == "post-patch" and .mandatory == true) | .id' "$RECORD")
-  FINALIZATION_RECHECK=false
-  patch_head=$(jq -er '.evidence.patch.head_sha' "$RECORD")
-  current_head=$(git -C "$WORKTREE" rev-parse HEAD) || die "cannot read current worktree HEAD"
-  [ "$current_head" = "$patch_head" ] || die "evidence is stale: submitted HEAD changed during finalization"
   missing=$(jq -r '
     . as $root
     | [$root.contract.checks[] | select(.mandatory == true) | .id as $id
@@ -502,6 +505,15 @@ finalize_record() {
        | .evidence.events += [{event: "finalize-blocked", reason: $reason}]'
     die "$reason"
   fi
+  assess_patch
+  FINALIZATION_RECHECK=true
+  while IFS= read -r check_id; do
+    run_check "$check_id" || die "mandatory post-patch check failed during finalization: $check_id"
+  done < <(jq -r '.contract.checks[] | select(.phase == "post-patch" and .mandatory == true) | .id' "$RECORD")
+  FINALIZATION_RECHECK=false
+  patch_head=$(jq -er '.evidence.patch.head_sha' "$RECORD")
+  current_head=$(git -C "$WORKTREE" rev-parse HEAD) || die "cannot read current worktree HEAD"
+  [ "$current_head" = "$patch_head" ] || die "evidence is stale: submitted HEAD changed during finalization"
   unexpected=$(jq -e '.evidence.patch.unexpected_scope == true' "$RECORD" >/dev/null 2>&1 && printf true || printf false)
   consequence=$(jq -er '.contract.assessment.consequence' "$RECORD")
   route=$(jq -er '.route' "$RECORD")

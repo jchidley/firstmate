@@ -4,6 +4,9 @@ The opt-in task-quality prototype is a sequential control-plane experiment for o
 
 It is not a new agent framework, an official pi-workflow bundle, a replacement for no-mistakes, or an automatic model router.
 
+The research basis and source links are recorded in
+`docs/task-quality-research.md`.
+
 ## Owner and invocation
 
 `bin/fm-task-quality.sh` is the single owner of the `fm-task-quality-contract.v1` contract and `fm-task-quality-evidence.v1` evidence formats.

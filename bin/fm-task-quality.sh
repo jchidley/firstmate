@@ -414,9 +414,17 @@ rerun_baseline_check() {
   return "$rc"
 }
 
+rerun_mandatory_phase_checks() {
+  local phase=$1 check_id
+  while IFS= read -r check_id; do
+    run_check "$check_id" || return 1
+  done < <(jq -r --arg phase "$phase" '.contract.checks[] | select(.phase == $phase and .mandatory == true) | .id' "$RECORD")
+}
+
 validate_child_record() {
-  local child=$1 parent_id=$2 child_parent child_status child_contract child_contract_sha
+  local child=$1 parent_id=$2 child_parent child_contract child_contract_sha
   local child_root child_worktree child_base child_head current_head
+  local parent_record=$RECORD parent_worktree=$WORKTREE parent_base=$BASE_SHA parent_recheck=$FINALIZATION_RECHECK
   jq -e 'type == "object" and .schema == "fm-task-quality-evidence.v1"' "$child" >/dev/null 2>&1 \
     || die "invalid child evidence record: $child"
   child_contract=$(jq -er '.contract_path' "$child") || die "child has no contract path: $child"
@@ -427,18 +435,21 @@ validate_child_record() {
   validate_contract "$child_contract"
   jq -e --argjson contract "$(jq -c . "$child_contract")" '.contract == $contract' "$child" >/dev/null 2>&1 \
     || die "child evidence contract does not match its contract file: $child"
+  load_record "$child"
   child_parent=$(jq -er '.contract.decomposition.parent_task_id // empty' "$child") \
     || die "child has no parent_task_id: $child"
   [ "$child_parent" = "$parent_id" ] || die "child parent_task_id does not match: $child"
-  child_status=$(jq -er '.disposition' "$child") || die "child has no disposition: $child"
-  [ "$child_status" = accepted ] || die "child is not independently accepted: $child"
-  jq -e '.evidence.patch != null and (.evidence.patch.unexpected_scope == false)' "$child" >/dev/null 2>&1 \
-    || die "child has no clean submitted-patch assessment: $child"
-  child_root=$(jq -er '.contract.repository.root' "$child")
-  child_worktree=$(jq -er '.contract.repository.worktree' "$child")
-  child_base=$(jq -er '.contract.repository.base_sha' "$child")
-  verify_isolated_worktree "$child_root" "$child_worktree" >/dev/null
-  child_head=$(jq -er '.evidence.patch.head_sha' "$child")
+  [ "$(jq -er '.route' "$RECORD")" = single-bounded-task ] \
+    || die "child route must be single-bounded-task: $child"
+  FINALIZATION_RECHECK=true
+  rerun_baseline_check || die "child baseline check failed: $child"
+  assess_patch
+  rerun_mandatory_phase_checks post-patch || die "child post-patch check failed: $child"
+  FINALIZATION_RECHECK=false
+  child_root=$ROOT
+  child_worktree=$WORKTREE
+  child_base=$BASE_SHA
+  child_head=$(jq -er '.evidence.patch.head_sha' "$RECORD")
   current_head=$(git -C "$child_worktree" rev-parse HEAD) || die "cannot read child worktree HEAD: $child"
   [ "$current_head" = "$child_head" ] || die "child evidence is stale: $child"
   git -C "$child_worktree" merge-base --is-ancestor "$child_base" "$child_head" \
@@ -446,6 +457,7 @@ validate_child_record() {
   assert_clean "$child_worktree"
   jq -e --arg base "$child_base" --arg head "$child_head" '
     .evidence.patch.base_sha == $base and .evidence.patch.head_sha == $head
+    and .evidence.patch.unexpected_scope == false
     and ([.evidence.checks[]? | select(.phase == "baseline") | .head_sha] | all(. == $base))
     and ([.evidence.checks[]? | select(.phase != "baseline") | .head_sha] | all(. == $head))
   ' "$child" >/dev/null 2>&1 || die "child evidence has inconsistent repository history: $child"
@@ -454,6 +466,10 @@ validate_child_record() {
     | all($root.contract.checks[] | select(.mandatory == true) | .id;
         . as $id | $root.evidence.checks[$id].status == "passed")
   ' "$child" >/dev/null 2>&1 || die "child has incomplete mandatory evidence: $child"
+  RECORD=$parent_record
+  WORKTREE=$parent_worktree
+  BASE_SHA=$parent_base
+  FINALIZATION_RECHECK=$parent_recheck
 }
 
 validate_decomposition() {
@@ -462,6 +478,10 @@ validate_decomposition() {
   [ "$route" = human-approved-decomposition ] || die "decomposition validation requires route=human-approved-decomposition"
   parent_id=$(jq -er '.task_id' "$RECORD")
   [ "$#" -gt 0 ] || die "at least one independently accepted child is required"
+  FINALIZATION_RECHECK=true
+  rerun_baseline_check || die "parent baseline check failed"
+  rerun_mandatory_phase_checks integration || die "parent integration check failed"
+  FINALIZATION_RECHECK=false
   child_ids='[]'
   for child in "$@"; do
     [ -f "$child" ] || die "child evidence record does not exist: $child"
@@ -473,9 +493,12 @@ validate_decomposition() {
     '$ids | sort == ($listed | sort)' >/dev/null 2>&1 \
     || die "supplied children do not exactly match the parent contract"
   jq -e '
-    any(.contract.checks[]; .phase == "integration" and .mandatory == true)
-    and any(.evidence.checks[]?; .phase == "integration" and .status == "passed" and .exit_code == 0)
-  ' "$RECORD" >/dev/null 2>&1 || die "parent integration evidence is missing or has not passed"
+    . as $root
+    | all($root.contract.checks[] | select(.phase == "integration" and .mandatory == true) | .id;
+        . as $id
+        | $root.evidence.checks[$id].status == "passed"
+          and $root.evidence.checks[$id].exit_code == 0)
+  ' "$RECORD" >/dev/null 2>&1 || die "parent mandatory integration evidence is missing or has not passed"
   atomic_jq "$RECORD" --argjson children "$child_ids" \
     '.evidence.decomposition = {validated: true, children: $children}
      | .evidence.events += [{event: "decomposition-validated", children: $children}]'

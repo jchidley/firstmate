@@ -299,7 +299,9 @@ run_check() {
     die "route=clarify requires human input before checks can run"
   fi
   if [ "$(jq -er '.route' "$RECORD")" != single-bounded-task ] && [ "$phase" != integration ]; then
-    die "route requires human-approved decomposition before non-integration checks"
+    jq -e --arg phase "$phase" \
+      '.evidence.decomposition.validated == true and $phase == "post-patch"' "$RECORD" >/dev/null 2>&1 \
+      || die "route requires human-approved decomposition before non-integration checks"
   fi
   steps=$(jq -er '.evidence.steps' "$RECORD")
   if [ "$steps" -ge "$steps_limit" ]; then
@@ -393,6 +395,25 @@ assess_patch() {
   printf 'patch assessed files=%s added=%s deleted=%s\n' "$files" "$added" "$deleted"
 }
 
+rerun_baseline_check() {
+  local original_worktree=$WORKTREE baseline_dir check_id rc
+  check_id=$(jq -er '.contract.checks[] | select(.phase == "baseline" and .mandatory == true) | .id' "$RECORD")
+  baseline_dir=$(mktemp -d "$original_worktree/.fm-task-quality-baseline.XXXXXX") \
+    || die "cannot create baseline verification directory"
+  git clone --no-hardlinks "$original_worktree" "$baseline_dir/worktree" >/dev/null 2>&1 \
+    || die "cannot create isolated baseline verification checkout"
+  git -C "$baseline_dir/worktree" checkout --detach "$BASE_SHA" >/dev/null 2>&1 \
+    || die "cannot prepare isolated baseline verification checkout"
+  WORKTREE="$baseline_dir/worktree"
+  set +e
+  run_check "$check_id"
+  rc=$?
+  set -e
+  WORKTREE=$original_worktree
+  rm -rf "$baseline_dir"
+  return "$rc"
+}
+
 validate_child_record() {
   local child=$1 parent_id=$2 child_parent child_status child_contract child_contract_sha
   local child_root child_worktree child_base child_head current_head
@@ -481,17 +502,31 @@ finalize_record() {
       '.status = "blocked" | .disposition = "needs-human" | .reason = $reason'
     die "worker-authored acceptance cannot authorize completion"
   }
-  jq -e --arg base "$BASE_SHA" '
+  missing=$(jq -r '
     . as $root
-    | all($root.contract.checks[] | select(.phase == "baseline" and .mandatory == true);
-        . as $check
-        | .id as $id
-        | $root.evidence.checks[$id].phase == "baseline"
-          and $root.evidence.checks[$id].command == $check.command
-          and $root.evidence.checks[$id].head_sha == $base
-          and $root.evidence.checks[$id].status == "passed"
-          and $root.evidence.checks[$id].exit_code == 0)
-  ' "$RECORD" >/dev/null 2>&1 || die "baseline evidence is missing or inconsistent"
+    | [$root.contract.checks[]
+       | select(.phase == "post-patch" and .mandatory == true)
+       | .id as $id
+       | select(($root.evidence.checks[$id].status // "missing") != "passed") | $id]
+    | join(",")
+  ' "$RECORD")
+  if [ -n "$missing" ]; then
+    reason="mandatory check evidence is incomplete or failed: $missing"
+    atomic_jq "$RECORD" --arg reason "$reason" \
+      '.status = "blocked" | .disposition = "needs-human" | .reason = $reason
+       | .evidence.events += [{event: "finalize-blocked", reason: $reason}]'
+    die "$reason"
+  fi
+  FINALIZATION_RECHECK=true
+  rerun_baseline_check || die "mandatory baseline check failed during finalization"
+  assess_patch
+  while IFS= read -r check_id; do
+    run_check "$check_id" || die "mandatory post-patch check failed during finalization: $check_id"
+  done < <(jq -r '.contract.checks[] | select(.phase == "post-patch" and .mandatory == true) | .id' "$RECORD")
+  FINALIZATION_RECHECK=false
+  patch_head=$(jq -er '.evidence.patch.head_sha' "$RECORD")
+  current_head=$(git -C "$WORKTREE" rev-parse HEAD) || die "cannot read current worktree HEAD"
+  [ "$current_head" = "$patch_head" ] || die "evidence is stale: submitted HEAD changed during finalization"
   missing=$(jq -r '
     . as $root
     | [$root.contract.checks[] | select(.mandatory == true) | .id as $id
@@ -505,15 +540,6 @@ finalize_record() {
        | .evidence.events += [{event: "finalize-blocked", reason: $reason}]'
     die "$reason"
   fi
-  assess_patch
-  FINALIZATION_RECHECK=true
-  while IFS= read -r check_id; do
-    run_check "$check_id" || die "mandatory post-patch check failed during finalization: $check_id"
-  done < <(jq -r '.contract.checks[] | select(.phase == "post-patch" and .mandatory == true) | .id' "$RECORD")
-  FINALIZATION_RECHECK=false
-  patch_head=$(jq -er '.evidence.patch.head_sha' "$RECORD")
-  current_head=$(git -C "$WORKTREE" rev-parse HEAD) || die "cannot read current worktree HEAD"
-  [ "$current_head" = "$patch_head" ] || die "evidence is stale: submitted HEAD changed during finalization"
   unexpected=$(jq -e '.evidence.patch.unexpected_scope == true' "$RECORD" >/dev/null 2>&1 && printf true || printf false)
   consequence=$(jq -er '.contract.assessment.consequence' "$RECORD")
   route=$(jq -er '.route' "$RECORD")

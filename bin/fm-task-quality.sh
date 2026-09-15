@@ -121,6 +121,12 @@ validate_contract() {
     and (.assessment.ambiguous | type == "boolean")
     and (.assessment.missing_information | type == "array")
     and (.assessment.decomposition_requested | type == "boolean")
+    and (if .assessment.decomposition_requested
+         then (.decomposition | type == "object"
+           and (.children | type == "array" and length > 0
+             and ([.[] | type == "string" and length > 0] | all)
+             and (length == (unique | length))))
+         else true end)
     and (.assessment.consequence | IN("ordinary", "elevated", "material"))
     and (.limits | type == "object")
     and (.limits.wall_seconds | type == "number" and floor == . and . > 0)
@@ -338,6 +344,12 @@ run_check() {
     if [ "$rc" -eq 0 ] && { [ "$post_head" != "$BASE_SHA" ] || [ -n "$post_changes" ]; }; then
       rc=1
       output="${output}${output:+$'\\n'}baseline command changed the worktree"
+    fi
+  else
+    post_changes=$(git -C "$WORKTREE" status --porcelain --untracked-files=all 2>/dev/null || printf '')
+    if [ "$rc" -eq 0 ] && [ -n "$post_changes" ]; then
+      rc=1
+      output="${output}${output:+$'\\n'}post-patch check changed the worktree"
     fi
   fi
   [ "$rc" -eq 0 ] && status=passed || status=failed

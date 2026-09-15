@@ -27,6 +27,8 @@
 # Material consequence and unexpected submitted scope always produce needs-human.
 set -eu
 
+FINALIZATION_RECHECK=false
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 # shellcheck disable=SC1091
@@ -276,8 +278,10 @@ run_check() {
   independent=$(printf '%s\n' "$check" | jq -r '.independent')
   steps_limit=$(jq -er '.contract.limits.steps' "$RECORD")
   wall_seconds=$(jq -er '.contract.limits.wall_seconds' "$RECORD")
-  jq -e --arg id "$id" '.evidence.checks[$id] == null' "$RECORD" >/dev/null \
-    || die "check already has evidence: $id"
+  if [ "$FINALIZATION_RECHECK" != true ]; then
+    jq -e --arg id "$id" '.evidence.checks[$id] == null' "$RECORD" >/dev/null \
+      || die "check already has evidence: $id"
+  fi
   case "$RECORD" in */*) ;; *) die "evidence path must include a directory" ;; esac
   if [ "$(jq -er '.route' "$RECORD")" = clarify ]; then
     die "route=clarify requires human input before checks can run"
@@ -378,9 +382,18 @@ assess_patch() {
 }
 
 validate_child_record() {
-  local child=$1 parent_id=$2 child_parent child_status
+  local child=$1 parent_id=$2 child_parent child_status child_contract child_contract_sha
+  local child_root child_worktree child_base child_head current_head
   jq -e 'type == "object" and .schema == "fm-task-quality-evidence.v1"' "$child" >/dev/null 2>&1 \
     || die "invalid child evidence record: $child"
+  child_contract=$(jq -er '.contract_path' "$child") || die "child has no contract path: $child"
+  child_contract_sha=$(jq -er '.contract_sha256' "$child") || die "child has no contract digest: $child"
+  [ -f "$child_contract" ] || die "child contract no longer exists: $child_contract"
+  [ "$(hash_file "$child_contract")" = "$child_contract_sha" ] \
+    || die "child contract changed after initialization: $child"
+  validate_contract "$child_contract"
+  jq -e --argjson contract "$(jq -c . "$child_contract")" '.contract == $contract' "$child" >/dev/null 2>&1 \
+    || die "child evidence contract does not match its contract file: $child"
   child_parent=$(jq -er '.contract.decomposition.parent_task_id // empty' "$child") \
     || die "child has no parent_task_id: $child"
   [ "$child_parent" = "$parent_id" ] || die "child parent_task_id does not match: $child"
@@ -388,6 +401,21 @@ validate_child_record() {
   [ "$child_status" = accepted ] || die "child is not independently accepted: $child"
   jq -e '.evidence.patch != null and (.evidence.patch.unexpected_scope == false)' "$child" >/dev/null 2>&1 \
     || die "child has no clean submitted-patch assessment: $child"
+  child_root=$(jq -er '.contract.repository.root' "$child")
+  child_worktree=$(jq -er '.contract.repository.worktree' "$child")
+  child_base=$(jq -er '.contract.repository.base_sha' "$child")
+  verify_isolated_worktree "$child_root" "$child_worktree" >/dev/null
+  child_head=$(jq -er '.evidence.patch.head_sha' "$child")
+  current_head=$(git -C "$child_worktree" rev-parse HEAD) || die "cannot read child worktree HEAD: $child"
+  [ "$current_head" = "$child_head" ] || die "child evidence is stale: $child"
+  git -C "$child_worktree" merge-base --is-ancestor "$child_base" "$child_head" \
+    || die "child submitted HEAD does not descend from its base: $child"
+  assert_clean "$child_worktree"
+  jq -e --arg base "$child_base" --arg head "$child_head" '
+    .evidence.patch.base_sha == $base and .evidence.patch.head_sha == $head
+    and ([.evidence.checks[]? | select(.phase == "baseline") | .head_sha] | all(. == $base))
+    and ([.evidence.checks[]? | select(.phase != "baseline") | .head_sha] | all(. == $head))
+  ' "$child" >/dev/null 2>&1 || die "child evidence has inconsistent repository history: $child"
   jq -e '
     . as $root
     | all($root.contract.checks[] | select(.mandatory == true) | .id;
@@ -408,8 +436,9 @@ validate_decomposition() {
     child_ids=$(jq -cn --argjson ids "$child_ids" --arg id "$(jq -er '.task_id' "$child")" '$ids + [$id]')
   done
   children_json=$(jq -c '.contract.decomposition.children // []' "$RECORD")
-  jq -e --argjson ids "$child_ids" --argjson listed "$children_json" 'all($ids[]; . as $id | ($listed | index($id)) != null)' \
-    >/dev/null 2>&1 || die "parent contract does not list every child"
+  jq -e --argjson ids "$child_ids" --argjson listed "$children_json" \
+    '$ids | sort == ($listed | sort)' >/dev/null 2>&1 \
+    || die "supplied children do not exactly match the parent contract"
   jq -e '
     any(.contract.checks[]; .phase == "integration" and .mandatory == true)
     and any(.evidence.checks[]?; .phase == "integration" and .status == "passed" and .exit_code == 0)
@@ -440,6 +469,26 @@ finalize_record() {
       '.status = "blocked" | .disposition = "needs-human" | .reason = $reason'
     die "worker-authored acceptance cannot authorize completion"
   }
+  jq -e --arg base "$BASE_SHA" '
+    . as $root
+    | all($root.contract.checks[] | select(.phase == "baseline" and .mandatory == true);
+        . as $check
+        | .id as $id
+        | $root.evidence.checks[$id].phase == "baseline"
+          and $root.evidence.checks[$id].command == $check.command
+          and $root.evidence.checks[$id].head_sha == $base
+          and $root.evidence.checks[$id].status == "passed"
+          and $root.evidence.checks[$id].exit_code == 0)
+  ' "$RECORD" >/dev/null 2>&1 || die "baseline evidence is missing or inconsistent"
+  assess_patch
+  FINALIZATION_RECHECK=true
+  while IFS= read -r check_id; do
+    run_check "$check_id" || die "mandatory post-patch check failed during finalization: $check_id"
+  done < <(jq -r '.contract.checks[] | select(.phase == "post-patch" and .mandatory == true) | .id' "$RECORD")
+  FINALIZATION_RECHECK=false
+  patch_head=$(jq -er '.evidence.patch.head_sha' "$RECORD")
+  current_head=$(git -C "$WORKTREE" rev-parse HEAD) || die "cannot read current worktree HEAD"
+  [ "$current_head" = "$patch_head" ] || die "evidence is stale: submitted HEAD changed during finalization"
   missing=$(jq -r '
     . as $root
     | [$root.contract.checks[] | select(.mandatory == true) | .id as $id
